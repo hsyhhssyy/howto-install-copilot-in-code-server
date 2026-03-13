@@ -35,10 +35,11 @@ get_user_data_dir() {
     fi
 }
 
-# Find compatible extension version
-find_compatible_version() {
+# List candidate extension versions.
+# Marketplace metadata for Copilot no longer reliably exposes engine constraints,
+# so we fetch recent versions and let code-server validate compatibility.
+list_candidate_versions() {
     local extension_id="$1"
-    local vscode_version="$2"
 
     local response
     response=$(curl -s -X POST "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery" \
@@ -52,27 +53,12 @@ find_compatible_version() {
                 ],
                 \"pageSize\": 50
             }],
-            \"flags\": 4112
+            \"flags\": 103
         }")
 
-    echo "$response" | jq -r --arg vscode_version "$vscode_version" '
-        .results[0].extensions[0].versions[] |
-        select(.version | test("^[0-9]+\\.[0-9]+\\.[0-9]*$")) |
-        select(.version | length < 8) |
-        {
-            version: .version,
-            engine: (.properties[] | select(.key == "Microsoft.VisualStudio.Code.Engine") | .value)
-        } |
-        select(.engine | ltrimstr("^") | split(".") |
-            map(split("-")[0] | tonumber?) as $engine_parts |
-            ($vscode_version | split(".") | map(tonumber)) as $vscode_parts |
-            (
-                ($engine_parts[0] // 0) < $vscode_parts[0] or
-                (($engine_parts[0] // 0) == $vscode_parts[0] and ($engine_parts[1] // 0) < $vscode_parts[1]) or
-                (($engine_parts[0] // 0) == $vscode_parts[0] and ($engine_parts[1] // 0) == $vscode_parts[1] and ($engine_parts[2] // 0) <= $vscode_parts[2])
-            )
-        ) |
-        .version' | head -n 1
+    echo "$response" | jq -r '
+        .results[0].extensions[0].versions[]?.version // empty
+    ' | awk 'NF && !seen[$0]++'
 }
 
 # Install extension
@@ -83,6 +69,13 @@ install_extension() {
     local extension_name
     extension_name=$(echo "$extension_id" | cut -d'.' -f2)
     local temp_dir="/tmp/code-extensions"
+    local version_safe
+    local archive_path
+    local vsix_path
+
+    version_safe=$(echo "$version" | tr -c 'A-Za-z0-9._-' '_')
+    archive_path="$temp_dir/$extension_name-$version_safe.vsix.gz"
+    vsix_path="$temp_dir/$extension_name-$version_safe.vsix"
 
     echo "Installing $extension_id v$version..."
 
@@ -92,33 +85,80 @@ install_extension() {
     # Download
     echo "  Downloading..."
     # Use curl with portable options (--progress-bar not available everywhere)
-    curl -L "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/GitHub/vsextensions/$extension_name/$version/vspackage" \
-        -o "$temp_dir/$extension_name.vsix.gz"
+    if ! curl -fLsS "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/GitHub/vsextensions/$extension_name/$version/vspackage" \
+        -o "$archive_path"; then
+        echo "  ✗ Download failed for $extension_id v$version"
+        rm -f "$archive_path" "$vsix_path"
+        return 1
+    fi
 
-    if [ ! -f "$temp_dir/$extension_name.vsix.gz" ]; then
+    if [ ! -s "$archive_path" ]; then
         echo "  ✗ Download failed for $extension_id"
+        rm -f "$archive_path" "$vsix_path"
         return 1
     fi
 
     # Decompress (handle both gunzip and gzip -d)
     if command -v gunzip >/dev/null 2>&1; then
-        gunzip -f "$temp_dir/$extension_name.vsix.gz"
+        if ! gunzip -f "$archive_path"; then
+            echo "  ✗ Failed to unpack $extension_id v$version"
+            rm -f "$archive_path" "$vsix_path"
+            return 1
+        fi
     else
-        gzip -df "$temp_dir/$extension_name.vsix.gz"
+        if ! gzip -df "$archive_path"; then
+            echo "  ✗ Failed to unpack $extension_id v$version"
+            rm -f "$archive_path" "$vsix_path"
+            return 1
+        fi
     fi
 
     # Install with user-data-dir if provided
     if [ -n "$user_data_dir" ]; then
-        code-server --user-data-dir="$user_data_dir" --force --install-extension "$temp_dir/$extension_name.vsix"
+        if ! code-server --user-data-dir="$user_data_dir" --force --install-extension "$vsix_path"; then
+            echo "  ✗ code-server rejected $extension_id v$version"
+            rm -f "$vsix_path"
+            return 1
+        fi
     else
-        code-server --force --install-extension "$temp_dir/$extension_name.vsix"
+        if ! code-server --force --install-extension "$vsix_path"; then
+            echo "  ✗ code-server rejected $extension_id v$version"
+            rm -f "$vsix_path"
+            return 1
+        fi
     fi
 
     # Clean up
-    rm -f "$temp_dir/$extension_name.vsix"
+    rm -f "$vsix_path"
 
     echo "  ✓ $extension_id installed successfully!"
     return 0
+}
+
+install_latest_compatible_extension() {
+    local extension_id="$1"
+    local user_data_dir="$2"
+    local tried=0
+    local version
+
+    while IFS= read -r version; do
+        [ -n "$version" ] || continue
+        tried=$((tried + 1))
+        echo "  Trying version: $version"
+        if install_extension "$extension_id" "$version" "$user_data_dir"; then
+            return 0
+        fi
+    done <<EOF
+$(list_candidate_versions "$extension_id")
+EOF
+
+    if [ "$tried" -eq 0 ]; then
+        echo "  ✗ No versions returned by Marketplace for $extension_id"
+    else
+        echo "  ✗ No installable version found for $extension_id after trying $tried version(s)"
+    fi
+
+    return 1
 }
 
 # Check for required dependencies
@@ -178,18 +218,9 @@ FAILED=0
 for ext in $EXTENSIONS; do
     echo "Processing $ext..."
 
-    # Find compatible version
-    version="$(find_compatible_version "$ext" "$VSCODE_VERSION")"
-
-    if [ -z "$version" ]; then
-        echo "  ✗ No compatible version found for $ext"
-        FAILED="$((FAILED + 1))"
-    else
-        echo "  Found compatible version: $version"
-        if ! install_extension "$ext" "$version" "$USER_DATA_DIR"; then
+        if ! install_latest_compatible_extension "$ext" "$USER_DATA_DIR"; then
             FAILED="$((FAILED + 1))"
         fi
-    fi
     echo ""
 done
 

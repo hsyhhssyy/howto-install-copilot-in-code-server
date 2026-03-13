@@ -35,6 +35,90 @@ get_user_data_dir() {
     fi
 }
 
+normalize_semver() {
+    echo "$1" | sed -E 's/^[^0-9]*([0-9]+\.[0-9]+\.[0-9]+).*/\1/'
+}
+
+version_lte() {
+    local left
+    local right
+    local left_major left_minor left_patch
+    local right_major right_minor right_patch
+
+    left="$(normalize_semver "$1")"
+    right="$(normalize_semver "$2")"
+
+    IFS=. read -r left_major left_minor left_patch <<EOF
+$left
+EOF
+    IFS=. read -r right_major right_minor right_patch <<EOF
+$right
+EOF
+
+    left_major=${left_major:-0}
+    left_minor=${left_minor:-0}
+    left_patch=${left_patch:-0}
+    right_major=${right_major:-0}
+    right_minor=${right_minor:-0}
+    right_patch=${right_patch:-0}
+
+    if [ "$left_major" -lt "$right_major" ]; then
+        return 0
+    fi
+    if [ "$left_major" -gt "$right_major" ]; then
+        return 1
+    fi
+    if [ "$left_minor" -lt "$right_minor" ]; then
+        return 0
+    fi
+    if [ "$left_minor" -gt "$right_minor" ]; then
+        return 1
+    fi
+    if [ "$left_patch" -le "$right_patch" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+extract_vsix_engine() {
+    local vsix_path="$1"
+
+    unzip -p "$vsix_path" extension/package.json 2>/dev/null | jq -r '.engines.vscode // .engines.code // empty'
+}
+
+is_vsix_prerelease() {
+    local vsix_path="$1"
+    local manifest_prerelease
+    local package_preview
+
+    manifest_prerelease="$({
+        unzip -p "$vsix_path" extension.vsixmanifest 2>/dev/null || true
+    } | grep -o 'Microsoft.VisualStudio.Code.PreRelease" Value="[^"]*' | sed 's/.*Value="//' | head -n1)"
+
+    if [ "$manifest_prerelease" = "true" ]; then
+        return 0
+    fi
+
+    package_preview="$(unzip -p "$vsix_path" extension/package.json 2>/dev/null | jq -r '.preview // false')"
+    if [ "$package_preview" = "true" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+is_engine_compatible() {
+    local engine_requirement="$1"
+    local vscode_version="$2"
+    local minimum_version
+
+    minimum_version="$(normalize_semver "$engine_requirement")"
+    [ -n "$minimum_version" ] || return 0
+
+    version_lte "$minimum_version" "$vscode_version"
+}
+
 # List candidate extension versions.
 # Marketplace metadata for Copilot no longer reliably exposes engine constraints,
 # so we fetch recent versions and let code-server validate compatibility.
@@ -72,6 +156,7 @@ install_extension() {
     local version_safe
     local archive_path
     local vsix_path
+    local engine_requirement
 
     version_safe=$(echo "$version" | tr -c 'A-Za-z0-9._-' '_')
     archive_path="$temp_dir/$extension_name-$version_safe.vsix.gz"
@@ -111,6 +196,19 @@ install_extension() {
             rm -f "$archive_path" "$vsix_path"
             return 1
         fi
+    fi
+
+    if is_vsix_prerelease "$vsix_path"; then
+        echo "  - Skipping $extension_id v$version: pre-release extension"
+        rm -f "$vsix_path"
+        return 1
+    fi
+
+    engine_requirement="$(extract_vsix_engine "$vsix_path")"
+    if [ -n "$engine_requirement" ] && ! is_engine_compatible "$engine_requirement" "$VSCODE_VERSION"; then
+        echo "  - Skipping $extension_id v$version: requires VS Code $engine_requirement"
+        rm -f "$vsix_path"
+        return 1
     fi
 
     # Install with user-data-dir if provided

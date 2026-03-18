@@ -29,5 +29,5 @@ chmod +x install-copilot.sh && ./install-copilot.sh
 
 ## Notes
 
-- The script now tries recent Marketplace versions in order and lets code-server decide compatibility during installation.
-- This avoids brittle version matching logic when Copilot extension metadata changes upstream.
+- The script now asks the Marketplace for recent versions first, skips versions already marked as preview/pre-release, and also skips versions whose Marketplace `Microsoft.VisualStudio.Code.Engine` requirement is already incompatible with the local code-server build.
+- It still verifies preview status and VS Code engine compatibility from the VSIX itself as a safety net after download.

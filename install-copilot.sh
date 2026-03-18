@@ -87,6 +87,19 @@ extract_vsix_engine() {
     unzip -p "$vsix_path" extension/package.json 2>/dev/null | jq -r '.engines.vscode // .engines.code // empty'
 }
 
+is_marketplace_prerelease() {
+    local prerelease_flag="$1"
+
+    case "${prerelease_flag:-}" in
+        true|1|yes)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 is_vsix_prerelease() {
     local vsix_path="$1"
     local manifest_prerelease
@@ -120,8 +133,9 @@ is_engine_compatible() {
 }
 
 # List candidate extension versions.
-# Marketplace metadata for Copilot no longer reliably exposes engine constraints,
-# so we fetch recent versions and let code-server validate compatibility.
+# Marketplace metadata is reliable enough to pre-filter known pre-release builds
+# and VS Code engine requirements before downloading VSIX packages.
+# We still keep VSIX inspection as a safety net during installation.
 list_candidate_versions() {
     local extension_id="$1"
 
@@ -137,12 +151,31 @@ list_candidate_versions() {
                 ],
                 \"pageSize\": 50
             }],
-            \"flags\": 103
+            \"flags\": 119
         }")
 
     echo "$response" | jq -r '
-        .results[0].extensions[0].versions[]?.version // empty
-    ' | awk 'NF && !seen[$0]++'
+        .results[0].extensions[0].versions[]?
+        | [
+            (.version // empty),
+            (
+                any(
+                    (.properties // [])[]?;
+                    (.key // "") == "Microsoft.VisualStudio.Code.PreRelease"
+                    and ((.value // "") | ascii_downcase) == "true"
+                )
+                | if . then "true" else "false" end
+            ),
+            (
+                first(
+                    (.properties // [])[]?
+                    | select((.key // "") == "Microsoft.VisualStudio.Code.Engine")
+                    | (.value // "")
+                ) // ""
+            )
+        ]
+        | @tsv
+    ' | awk -F '\t' 'NF && !seen[$1]++ { print $1 "\t" $2 "\t" $3 }'
 }
 
 # Install extension
@@ -238,9 +271,22 @@ install_latest_compatible_extension() {
     local user_data_dir="$2"
     local tried=0
     local version
+    local prerelease_flag
+    local marketplace_engine
 
-    while IFS= read -r version; do
+    while IFS=$'\t' read -r version prerelease_flag marketplace_engine; do
         [ -n "$version" ] || continue
+
+        if is_marketplace_prerelease "$prerelease_flag"; then
+            echo "  - Skipping $extension_id v$version: marketplace marks it as pre-release"
+            continue
+        fi
+
+        if [ -n "$marketplace_engine" ] && ! is_engine_compatible "$marketplace_engine" "$VSCODE_VERSION"; then
+            echo "  - Skipping $extension_id v$version: marketplace requires VS Code $marketplace_engine"
+            continue
+        fi
+
         tried=$((tried + 1))
         echo "  Trying version: $version"
         if install_extension "$extension_id" "$version" "$user_data_dir"; then

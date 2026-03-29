@@ -12,7 +12,7 @@ if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
 fi
 
 if [ -n "$LOCAL_SCRIPT" ]; then
-	exec "$LOCAL_SCRIPT" GitHub.copilot GitHub.copilot-chat
+	exec "$LOCAL_SCRIPT" anthropic.claude-code
 fi
 
-curl -fsSL "$RAW_BASE_URL/install-code-server-extension.sh" | bash -s -- GitHub.copilot GitHub.copilot-chat
+curl -fsSL "$RAW_BASE_URL/install-code-server-extension.sh" | bash -s -- anthropic.claude-code
